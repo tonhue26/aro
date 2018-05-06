@@ -1,0 +1,207 @@
+#!/usr/bin/php
+<?php
+echo "######################\n";
+echo "# Arionum Miner v0.1 #\n";
+echo "# www.arionum.com    #\n";
+echo "######################\n\n";
+error_reporting(0);
+if (!extension_loaded("gmp")) die("gmp php extension missing");
+if(floatval(phpversion())<7.2) die("The minimum php version required is 7.2");
+if (!defined("PASSWORD_ARGON2I")) die("The php version is not compiled with argon2i support");
+
+ini_set("memory_limit","5G");
+
+$type=trim($argv[1]);
+
+$node=trim($argv[2]);
+$public_key=trim($argv[3]);
+$private_key=trim($argv[4]);
+
+
+if(empty($type)||empty($public_key)||empty($node)||($type=="solo"&&empty($private_key))){
+echo "Usage:
+
+For Solo mining: ./miner solo <node> <public_key> <private_key>
+
+For Pool mining: ./miner pool <pool-address> <your-address>\n\n";
+exit;
+}
+if($type=="pool") $private_key=$public_key;
+
+   //all credits for this base58 functions should go to tuupola / https://github.com/tuupola/base58/
+    function baseConvert(array $source, $source_base, $target_base)
+    {
+        $result = [];
+        while ($count = count($source)) {
+            $quotient = [];
+            $remainder = 0;
+            for ($i = 0; $i !== $count; $i++) {
+                $accumulator = $source[$i] + $remainder * $source_base;
+                $digit = (integer) ($accumulator / $target_base);
+                $remainder = $accumulator % $target_base;
+                if (count($quotient) || $digit) {
+                    array_push($quotient, $digit);
+                };
+            }
+            array_unshift($result, $remainder);
+            $source = $quotient;
+        }
+        return $result;
+    }
+     function base58_decode($data, $integer = false)
+    {
+        $data = str_split($data);
+        $data = array_map(function ($character) {
+                $chars="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+            return strpos($chars, $character);
+        }, $data);
+        /* Return as integer when requested. */
+        if ($integer) {
+            $converted = baseConvert($data, 58, 10);
+            return (integer) implode("", $converted);
+        }
+        $converted = baseConvert($data, 58, 256);
+        return implode("", array_map(function ($ascii) {
+            return chr($ascii);
+        }, $converted));
+    }
+
+class Miner {
+    private $public_key;
+    private $private_key;
+	private $speed;
+	private $node;
+	private $block;
+	private $difficulty;
+	private $counter;
+	private $type;
+	private $limit;
+	private $worker;
+	private $last_update;
+	public function prepare($pub, $priv, $node, $type,$worker){
+				$this->public_key=$pub;
+		                $this->private_key=$priv;
+				$this->node=$node;
+				$this->type=$type;
+				$this->worker=$worker;				
+	}
+
+	public function update(){
+		$this->last_update=time();
+		echo "--> Updating mining info\n";
+		$extra="";
+		if($this->type=="pool") $extra="&worker=".$this->worker."&address=".$this->private_key."&hashrate=".$this->speed;
+		 $res=file_get_contents($this->node."/mine.php?q=info".$extra);
+
+        	 $info=json_decode($res,true);
+       		 if($info['status']!="ok") return false;
+		$data=$info['data'];
+		$this->block=$data['block'];
+		$this->difficulty=$data['difficulty'];
+		if($this->type=="pool"){
+			$this->limit=$data['limit'];
+			$this->public_key=$data['public_key'];
+		} else {
+			$this->limit=240;
+		}
+		echo "Min DL: ".$this->limit."\n";
+		return true;
+	}
+	private function submit($nonce,$argon){
+
+		$argon=substr($argon,29);
+		echo "--> Submitting nonce $nonce / $argon\n";
+
+		
+
+
+		$postdata = http_build_query(
+			array(
+				'argon' => $argon,
+				'nonce' => $nonce,
+				'private_key' => $this->private_key,
+				'public_key' => $this->public_key,
+				'address'=> $this->private_key,
+			)
+		);
+		
+		$opts = array('http' =>
+			array(
+				'method'  => 'POST',
+				'header'  => 'Content-type: application/x-www-form-urlencoded',
+				'content' => $postdata
+			)
+		);
+		
+		$context  = stream_context_create($opts);
+		
+		$res = file_get_contents($this->node."/mine.php?q=submitNonce", false, $context);
+		$data=json_decode($res,true);
+
+		if($data['status']=="ok") echo "\n--> Nonce confirmed.\n";
+		else echo "--> The nonce did not confirm.\n\n";
+		
+	}
+	public function run(){
+		$it=0;
+		$start=microtime(true);
+		while(1){
+		$this->counter++;
+		if(time()-$this->last_update>2) {
+			echo "--> Hash rate: ".$this->speed." H/s\n";
+			$this->update();
+			$this->counter=0;
+		}
+	        $nonce=base64_encode(openssl_random_pseudo_bytes(32));
+        	$nonce = preg_replace("/[^a-zA-Z0-9]/", "", $nonce);
+			$base=$this->public_key."-".$nonce."-".$this->block."-".$this->difficulty;
+			$argon=password_hash($base, PASSWORD_ARGON2I, array('memory_cost' => 16384, "time_cost"=>4, "threads"=>4));
+
+			$hash=$base.$argon;
+			for($i=0;$i<5;$i++){
+				$hash=hash("sha512",$hash,true);
+			}		
+			$hash=hash("sha512",$hash);
+			
+
+			$m=str_split($hash,2);
+
+			$duration=hexdec($m[10]).hexdec($m[15]).hexdec($m[20]).hexdec($m[23]).hexdec($m[31]).hexdec($m[40]).hexdec($m[45]).hexdec($m[55]);
+			$duration=ltrim($duration, '0');
+						
+			$result=gmp_div($duration,$this->difficulty);
+			if($result>0&&$result<=$this->limit){
+				$this->submit($nonce,$argon);		
+				
+			}
+			$it++;
+			if($it==100){ 
+				$it=0;
+				$end=microtime(true);
+				$this->speed=100/($end-$start);
+				$start=$end;
+			}
+			
+		}
+
+	}	
+
+
+}
+//checking if the address is valid
+if($type=="pool"){
+	$dst_b=base58_decode($public_key);
+	if(strlen($dst_b)!=64)  die("ERROR: Invalid Arionum address!");
+}
+
+$worker=uniqid();
+
+$miner= new Miner;
+$miner->prepare($public_key,$private_key, $node,$type,$worker);
+$res=$miner->update();
+if(!$res) die("ERROR: Could not get mining info frm the node");
+
+$miner->run();
+
+
+?>
